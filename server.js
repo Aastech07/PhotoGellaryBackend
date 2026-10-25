@@ -39,31 +39,84 @@ app.use('/uploads', express.static(uploadsDir));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Fallback in-memory cache if MongoDB is offline
-let isMongoConnected = false;
 let fallbackPhotos = [];
+let isMongoConnecting = false;
 
-// Connect to MongoDB
-mongoose.connect(MONGODB_URI, {
-  serverSelectionTimeoutMS: 5000,
-})
-  .then(() => {
-    isMongoConnected = true;
-    console.log('✅ Connected to MongoDB successfully:', MONGODB_URI);
+// Check if MongoDB is actually ready
+function isDbReady() {
+  return mongoose.connection.readyState === 1;
+}
+
+// Auto-sync fallback photos from disk to MongoDB
+async function syncDiskPhotosToMongo() {
+  if (!isDbReady()) return;
+  try {
+    const diskFiles = fs.readdirSync(uploadsDir).filter(f => !f.startsWith('.'));
+    let synced = 0;
+    for (const filename of diskFiles) {
+      const exists = await Photo.findOne({ fileName: filename });
+      if (!exists) {
+        const stat = fs.statSync(path.join(uploadsDir, filename));
+        await Photo.create({
+          fileName: filename,
+          originalName: filename,
+          mimeType: 'image/jpeg',
+          sizeBytes: stat.size,
+          storagePath: path.join(uploadsDir, filename),
+          url: `/uploads/${filename}`,
+          uploadedAt: stat.mtime || new Date(),
+        });
+        synced++;
+      }
+    }
+    if (synced > 0) {
+      console.log(`✅ Synced ${synced} disk photos into MongoDB Atlas`);
+    }
+  } catch (err) {
+    console.warn('⚠️ Sync disk photos to Mongo error:', err.message);
+  }
+}
+
+// Connect to MongoDB with auto-retry
+function connectMongoDB() {
+  if (isDbReady() || isMongoConnecting) return;
+  isMongoConnecting = true;
+  console.log('🔄 Connecting to MongoDB Atlas...');
+
+  mongoose.connect(MONGODB_URI, {
+    serverSelectionTimeoutMS: 30000,
+    connectTimeoutMS: 30000,
+    socketTimeoutMS: 45000,
   })
-  .catch((err) => {
-    isMongoConnected = false;
-    console.warn('⚠️  MongoDB connection warning:', err.message);
-    console.warn('👉 Server will continue running! Files will be saved to disk & local cache.');
-    console.warn('👉 To connect MongoDB later, start mongod or set MONGODB_URI in server/.env');
-  });
+    .then(() => {
+      isMongoConnecting = false;
+      console.log('✅ Connected to MongoDB Atlas successfully:', MONGODB_URI.replace(/\/\/([^:]+):([^@]+)@/, '//***:***@'));
+      syncDiskPhotosToMongo();
+    })
+    .catch((err) => {
+      isMongoConnecting = false;
+      console.warn('⚠️ MongoDB connection warning:', err.message);
+      console.warn('👉 Server will continue running with disk fallback! Retrying in 10s...');
+      setTimeout(connectMongoDB, 10000);
+    });
+}
 
 mongoose.connection.on('connected', () => {
-  isMongoConnected = true;
+  console.log('✅ MongoDB connection event: CONNECTED');
+  syncDiskPhotosToMongo();
 });
 
 mongoose.connection.on('disconnected', () => {
-  isMongoConnected = false;
+  console.warn('⚠️ MongoDB connection event: DISCONNECTED. Reconnecting...');
+  setTimeout(connectMongoDB, 5000);
 });
+
+mongoose.connection.on('error', (err) => {
+  console.warn('⚠️ MongoDB connection error event:', err.message);
+});
+
+// Initial connection
+connectMongoDB();
 
 // Configure Multer storage
 const storage = multer.diskStorage({
@@ -105,25 +158,74 @@ function getLocalIpAddress() {
  * Health check & status endpoint
  */
 app.get('/api/status', async (req, res) => {
+  const ready = isDbReady();
   let photoCount = 0;
-  if (isMongoConnected) {
+
+  if (ready) {
     try {
       photoCount = await Photo.countDocuments();
     } catch {
       photoCount = fallbackPhotos.length;
     }
   } else {
-    photoCount = fallbackPhotos.length;
+    // Reconnection attempt in background if not connected
+    connectMongoDB();
+    const diskFiles = fs.existsSync(uploadsDir) ? fs.readdirSync(uploadsDir).filter(f => !f.startsWith('.')) : [];
+    photoCount = diskFiles.length;
   }
 
+  const states = ['disconnected', 'connected', 'connecting', 'disconnecting'];
   res.json({
     status: 'ok',
     serverTime: new Date().toISOString(),
-    mongoConnected: isMongoConnected,
+    mongoConnected: ready,
+    mongoState: states[mongoose.connection.readyState] || 'unknown',
     mongoUri: MONGODB_URI.replace(/\/\/([^:]+):([^@]+)@/, '//***:***@'),
     totalPhotos: photoCount,
     port: PORT,
     hostIp: getLocalIpAddress(),
+  });
+});
+
+/**
+ * DB diagnostics endpoint to inspect exact MongoDB connection status and errors
+ */
+app.get('/api/db-diagnostics', async (req, res) => {
+  const states = ['disconnected', 'connected', 'connecting', 'disconnecting'];
+  const stateStr = states[mongoose.connection.readyState] || 'unknown';
+  let pingResult = null;
+  let errorMsg = null;
+
+  try {
+    if (mongoose.connection.readyState !== 1) {
+      await mongoose.connect(MONGODB_URI, {
+        serverSelectionTimeoutMS: 15000,
+        connectTimeoutMS: 15000,
+      });
+    }
+    const adminDb = mongoose.connection.db.admin();
+    pingResult = await adminDb.ping();
+  } catch (err) {
+    errorMsg = err.message;
+  }
+
+  let dbPhotos = 0;
+  try {
+    if (mongoose.connection.readyState === 1) {
+      dbPhotos = await Photo.countDocuments();
+    }
+  } catch (err) {
+    dbPhotos = -1;
+  }
+
+  res.json({
+    readyState: mongoose.connection.readyState,
+    state: stateStr,
+    mongoConnected: mongoose.connection.readyState === 1,
+    ping: pingResult,
+    error: errorMsg,
+    totalPhotosInDb: dbPhotos,
+    mongoUri: MONGODB_URI.replace(/\/\/([^:]+):([^@]+)@/, '//***:***@'),
   });
 });
 
@@ -163,12 +265,18 @@ app.post('/api/upload', (req, res) => {
       uploadedAt: new Date(),
     };
 
-    if (isMongoConnected) {
+    if (!isDbReady()) {
+      connectMongoDB();
+    }
+
+    if (isDbReady()) {
       try {
         const photoDoc = await Photo.create(photoData);
+        console.log(`✅ Photo saved to MongoDB Atlas: ${originalName} (ID: ${photoDoc._id})`);
         return res.status(201).json({
           success: true,
-          message: 'Photo uploaded and saved to MongoDB',
+          message: 'Photo uploaded and saved to MongoDB Atlas',
+          storage: 'mongodb',
           photo: photoDoc,
         });
       } catch (dbErr) {
@@ -183,6 +291,7 @@ app.post('/api/upload', (req, res) => {
     return res.status(201).json({
       success: true,
       message: 'Photo uploaded to disk & local cache (MongoDB offline)',
+      storage: 'disk_fallback',
       photo: fallbackItem,
     });
   });
@@ -212,7 +321,7 @@ app.post('/api/upload-batch', upload.array('photos', 50), async (req, res) => {
         uploadedAt: new Date(),
       };
 
-      if (isMongoConnected) {
+      if (isDbReady()) {
         try {
           const doc = await Photo.create(photoData);
           savedPhotos.push(doc);
@@ -245,7 +354,7 @@ app.get('/api/photos', async (req, res) => {
   try {
     const baseUrl = getBaseUrl(req);
 
-    if (isMongoConnected) {
+    if (isDbReady()) {
       const photos = await Photo.find().sort({ uploadedAt: -1 }).lean();
       // Ensure URL matches current host
       const updatedPhotos = photos.map(p => ({
