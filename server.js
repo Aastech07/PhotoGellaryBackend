@@ -11,8 +11,16 @@ const archiver = require('archiver');
 const Photo = require('./models/Photo');
 
 const app = express();
+app.set('trust proxy', 1); // Trust Render & Cloud reverse proxies for HTTPS
 const PORT = process.env.PORT || 5000;
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/gallery_db';
+
+// Helper to get dynamic base URL with protocol (https on Render / cloud)
+function getBaseUrl(req) {
+  const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
+  const host = req.get('host');
+  return `${proto}://${host}`;
+}
 
 // Ensure uploads folder exists
 const uploadsDir = path.join(__dirname, 'uploads');
@@ -137,9 +145,8 @@ app.post('/api/upload', (req, res) => {
       return res.status(400).json({ success: false, error: 'No image file uploaded' });
     }
 
-    const host = req.get('host');
-    const protocol = req.protocol;
-    const photoUrl = `${protocol}://${host}/uploads/${file.filename}`;
+    const baseUrl = getBaseUrl(req);
+    const photoUrl = `${baseUrl}/uploads/${file.filename}`;
     const originalName = req.body.originalName || file.originalname || file.filename;
     const devicePhotoId = req.body.id || req.body.devicePhotoId || '';
     const dateAdded = req.body.dateAdded ? new Date(Number(req.body.dateAdded) * 1000) : new Date();
@@ -190,12 +197,11 @@ app.post('/api/upload-batch', upload.array('photos', 50), async (req, res) => {
       return res.status(400).json({ success: false, error: 'No files uploaded' });
     }
 
-    const host = req.get('host');
-    const protocol = req.protocol;
+    const baseUrl = getBaseUrl(req);
     const savedPhotos = [];
 
     for (const file of req.files) {
-      const photoUrl = `${protocol}://${host}/uploads/${file.filename}`;
+      const photoUrl = `${baseUrl}/uploads/${file.filename}`;
       const photoData = {
         fileName: file.filename,
         originalName: file.originalname,
@@ -237,15 +243,14 @@ app.post('/api/upload-batch', upload.array('photos', 50), async (req, res) => {
  */
 app.get('/api/photos', async (req, res) => {
   try {
-    const host = req.get('host');
-    const protocol = req.protocol;
+    const baseUrl = getBaseUrl(req);
 
     if (isMongoConnected) {
       const photos = await Photo.find().sort({ uploadedAt: -1 }).lean();
       // Ensure URL matches current host
       const updatedPhotos = photos.map(p => ({
         ...p,
-        url: `${protocol}://${host}/uploads/${p.fileName}`
+        url: `${baseUrl}/uploads/${p.fileName}`
       }));
       return res.json({ success: true, count: updatedPhotos.length, photos: updatedPhotos });
     }
@@ -259,7 +264,7 @@ app.get('/api/photos', async (req, res) => {
         fileName: filename,
         originalName: filename,
         sizeBytes: stat.size,
-        url: `${protocol}://${host}/uploads/${filename}`,
+        url: `${baseUrl}/uploads/${filename}`,
         uploadedAt: stat.birthtime || stat.mtime,
       };
     }).sort((a, b) => new Date(b.uploadedAt) - new Date(a.uploadedAt));

@@ -530,8 +530,8 @@
       </div>
       <div class="stat-card">
         <div class="stat-label">Android Connection Endpoint</div>
-        <div class="stat-value" style="font-size: 18px; font-family: 'JetBrains Mono', monospace;" id="endpointHost">http://10.171.94.177:5000</div>
-        <div class="stat-hint">Or http://10.0.2.2:5000 for Android Emulator</div>
+        <div class="stat-value" style="font-size: 15px; font-family: 'JetBrains Mono', monospace;" id="endpointHost">https://photogellarybackend.onrender.com</div>
+        <div class="stat-hint" id="endpointHint">☁️ Live Cloud Production API</div>
       </div>
     </div>
 
@@ -604,8 +604,12 @@
           mongoDot.classList.add('disconnected');
         }
 
-        if (data.hostIp) {
+        if (window.location.hostname.includes('render.com') || window.location.protocol === 'https:') {
+          document.getElementById('endpointHost').textContent = window.location.origin;
+          document.getElementById('endpointHint').textContent = '☁️ Live Cloud Production API';
+        } else if (data.hostIp) {
           document.getElementById('endpointHost').textContent = `http://${data.hostIp}:${data.port || 5000}`;
+          document.getElementById('endpointHint').textContent = '💻 Local Development Server';
         }
       } catch (err) {
         document.getElementById('serverStatus').textContent = 'Offline';
